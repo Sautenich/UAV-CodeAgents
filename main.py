@@ -1,268 +1,680 @@
-import os
-import config
-import time
 import csv
-import litellm
+import io
+import os
+import time
 import urllib.request
+from dotenv import load_dotenv
 import httpx
 import litellm
 import matplotlib
-from smolagents import LiteLLMModel
-from src.data_loader import fetch_images_from_github, load_local_images
-from src.tools_Gemini import (
-    describe_satellite_image_Gemini,
-    pixelpoint_objects_Gemini,
-    detect_and_display_Gemini
-)
+from smolagents import ToolCallingAgent
+from openinference.instrumentation.smolagents import SmolagentsInstrumentor
+from phoenix.otel import register
+import requests
+from smolagents import CodeAgent, LiteLLMModel
+import src.tools as tools
+from src.agent_factory import create_airspace_manager, create_uav_agent
+import config
+import random
+from src.data_loader import fetch_images_from_github, load_local_map_images
 from src.tools import (
     describe_satellite_image,
-    pixelpoint_objects, 
-    visualize_keypoints_from_image, 
-    uav_simulation, 
     detect_and_display,
-    resolve_objects_from_query
+    extract_inspection_targets,
+    get_folder_by_query,
+    pixelpoint_objects,
+    uav_simulation,
+    visualize_keypoints_from_image,
+     SWARM_FLIGHT_TIMES 
+
 )
-from src.agent_factory import create_uav_agent, create_airspace_manager
+from src.tools_Gemini import (
+    describe_satellite_image_Gemini,
+    detect_and_display_Gemini,
+    extract_inspection_targets_Gemini,
+    pixelpoint_objects_Gemini,
+)
+from src.weight_tools import download_and_sync_weights, run_local_uav_detection
+
+# 1. Load .env environment variables
+load_dotenv(override=True)
+
+# , simulate realistic flight for each drone with GIF generation
+
+# Clean up proxy environment variables BEFORE importing phoenix, httpx, requests, urllib
+for key in [
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "socks_proxy",
+    "SOCKS_PROXY",
+]:
+    os.environ.pop(key, None)
+
+# 1. Disable GUI display attempts (prevents Tkinter / Tcl core dumps in headless environments)
+os.environ["MPLBACKEND"] = "Agg"
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+# 2. Prevent LiteLLM hangs during model cost map downloads
+os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 
 urllib.request.getproxies = lambda: {}
+litellm.request_timeout = 180.0
 
-for key in ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']:
-    os.environ.pop(key, None)
-os.environ['no_proxy'] = '*'
+os.environ["NO_PROXY"] = "localhost,127.0.0.1,0.0.0.0"
+os.environ["no_proxy"] = "localhost,127.0.0.1,0.0.0.0"
 
-matplotlib.use('Agg')  # Отключает GUI-движок Tkinter, оставляя чистую генерацию картинок в памяти
-# litellm._turn_on_debug()  # Включает детальный вывод сетевых запросов и ошибок API
+# 2. Register OTLP exporter for Arize Phoenix
+tracer_provider = register(
+    project_name="uav_agent",
+    endpoint="http://localhost:6006/v1/traces",
+)
+
+# 3. Attach smolagents instrumentation hook
+SmolagentsInstrumentor().instrument(tracer_provider=tracer_provider)
+litellm.num_retries = 5
+litellm.retry_strategy = "exponential_backoff_retry"
+
+# Disable Tkinter GUI engine to render figures directly in memory
+matplotlib.use("Agg")
+# litellm._turn_on_debug()  # Enables verbose logging for API calls and network errors
 
 COMMANDS = {
-    "fire": "Analyze the area for fire. Locate the source and report the extent.",
-    "oil_spill": "Detect any signs of an oil spill in the water bodies or on the ground.",
-    "car_accident": "A car accident has occurred. The police are on the scene.",
-    "hogweed_thickets": "Hogweed thickets are growing in the area.",
-    "unauthorized_festival": "Unauthorized festival is taking place in the area.",
+    "fire": {
+        "keywords": ["fire", "smoke", "flame", "burn", "burning"],
+        "request": (
+            "I need to check at home; one of them might be on right now fire."
+        ),
+        "folder": "fire",
+        "target_object": "fire",
+        "incident_type": "fire",
+    },
+    "oil_spill": {
+        "keywords": ["oil", "spill", "leak", "slick", "pollution"],
+        "request": (
+            "Detect any signs of an oil spill in the water bodies or on the"
+            " ground."
+        ),
+        "folder": "oil_spill",
+        "target_object": "oil spill",
+        "incident_type": "oil_spill",
+    },
+    "car_accident": {
+        "keywords": ["car", "accident", "crash", "collision", "vehicle"],
+        "request": "A car accident has occurred. The police are on the scene.",
+        "folder": "cars_accident",
+        "target_object": "car accident",
+        "incident_type": "car_accident",
+    },
+    "hogweed_thickets": {
+        "keywords": ["hogweed", "weed", "thicket", "heracleum"],
+        "request": "Hogweed thickets are growing in the area.",
+        "folder": "hogweed_thickets",
+        "target_object": "hogweed thickets",
+        "incident_type": "hogweed_thickets",
+    },
+    "illegal_buildings": {
+        "keywords": [
+            "illegal",
+            "building",
+            "construction",
+            "unauthorized",
+            "shed",
+        ],
+        "request": "Illegal buildings are being constructed in the area.",
+        "folder": "illegal_buildings",
+        "target_object": "illegal building",
+        "incident_type": "illegal_buildings",
+    },
 }
 
 
+def resolve_scenario(user_input: str, commands: dict) -> dict:
+    raw_text = user_input.strip().lower()
+
+    # 1. Default to 'fire' if input is empty (user pressed Enter)
+    if not raw_text:
+        return commands["fire"].copy()
+
+    # 2. Direct match with dictionary keys (e.g. 'fire' or 'oil_spill')
+    if raw_text in commands:
+        return commands[raw_text].copy()
+
+    # 3. Match keywords inside the entered sentence
+    for key, data in commands.items():
+        for kw in data.get("keywords", []):
+            # Check keyword presence as a standalone marker
+            if kw in raw_text:
+                matched_scenario = data.copy()
+                # Preserve the extended sentence as the specific user prompt
+                if len(user_input.strip().split()) > 1:
+                    matched_scenario["request"] = user_input.strip()
+                return matched_scenario
+
+    # 4. Fallback: default to 'fire' if no scenario matched
+    print(
+        f"⚠️ Keywords not recognized in '{user_input}'. Defaulting to 'fire'"
+        " scenario."
+    )
+    default_scenario = commands["fire"].copy()
+    if len(user_input.strip().split()) > 1:
+        default_scenario["request"] = user_input.strip()
+    return default_scenario
+
+
 def main():
+    # """
+    # Debug workflow to validate individual tools and pipeline components
+    # within a single script without invoking full multi-agent orchestration.
+    # """
+
+    # selected_key = input("Enter scenario: ").strip()
+
+    # target_object = extract_inspection_targets(selected_key)
+    # print(target_object)
+
+    # # 1. Scenario selection
+    # # print("Available scenarios:", list(COMMANDS.keys()))
+    # # selected_key = input("Enter scenario key (or press Enter for 'fire'): ").strip()
+    # if not selected_key or selected_key not in COMMANDS:
+    #     selected_key = "fire"
+    # user_request = COMMANDS[selected_key]
+    # print(f"\n📝 Selected prompt: '{user_request}'")
 
     # base_path = "data"
-    
-    # print("Загрузка данных из локальной папки...")
-    
-    # Загружаем изображения, если папки существуют
-    # load_local_images должна возвращать список кортежей (image, filename)
-    # blank_images = load_local_images(os.path.join(base_path, "default"))
-    # fire_images = load_local_images(os.path.join(base_path, "fire"))
-    # hogweed_images = load_local_images(os.path.join(base_path, "hogweed_thickets"))
-    # oil_spill_images = load_local_images(os.path.join(base_path, "oil_spill"))
-    # car_images = load_local_images(os.path.join(base_path, "cars_accident"))
-    # unauthorized_festival_images = load_local_images(os.path.join(base_path, "unauthorized_festival"))
 
-    # if not blank_images or not fire_images:
-    #     print("Ошибка: Изображения не найдены в папках data/default или data/fire!")
-    #     return
-    #     # Загружаем обе папки: "blank" (база) и "fire" (цель)
+    # scenario = COMMANDS[selected_key]
+    # user_request = scenario["request"]
+    # folder_name = scenario["folder"]
+    # # target_object = scenario["target_object"]
+    # incident_type = scenario["incident_type"]
 
-    # print("Загрузка данных с GitHub...")
-        # Передаем аргументы явно, сопоставляя ключи из config с ожидаемыми именами
-    # Объявляем переменные настроек внутри функции
-    # blank_settings = config.REPO_SETTINGS["default"]
-    # fire_settings = config.REPO_SETTINGS["fire"]
+    # print(f"\n📝 Selected prompt: '{user_request}'")
+    # print(f"📊 Parameters: Folder='{folder_name}', Target='{target_object}', Incident='{incident_type}'")
 
+    # # 2. Download / Synchronize model weights
+    # print(f"\n--- STEP 1: Syncing weights for incident '{incident_type}' ---")
+    # weights_path = download_and_sync_weights(incident_type)
+    # print(f"📍 Onboard weights path: {weights_path}")
 
-    # blank_images = fetch_images_from_github(
-    #     repo_owner=blank_settings["owner"],
-    #     repo_name=blank_settings["repo"],
-    #     folder_path=blank_settings["folder"],
-    #     branch=blank_settings["branch"]
-    # )
-    
-    # fire_images = fetch_images_from_github(
-    #     repo_owner=fire_settings["owner"],
-    #     repo_name=fire_settings["repo"],
-    #     folder_path=fire_settings["folder"],
-    #     branch=fire_settings["branch"]
-    # )
-    # print("Загрузка данных с GitHub...")
+    # # 3. Load regional map images
+    # print(f"\n--- STEP 2: Loading terrain imagery ---")
 
-    # if not blank_images or not fire_images:
-    #     print("Ошибка: изображения не были загружены!")
-    #     return
+    # base_data_path = f"data/{folder_name}"
 
-    # Берем по одному изображению для теста
-    # base_image = blank_images[0][0]    # Чистая зона
-    # target_image = fire_images[0][0] 
-    # target_image = hogweed_images[0][0]   
-    # target_image = unauthorized_festival_images[0][0]   
-    # target_image = oil_spill_images[0][0]   
-    # target_image = car_images[0][0]   
+    # if os.path.exists("data/default") and os.path.exists(base_data_path):
+    #     print("📥 Loading maps from local directories...")
+    #     blank_tuple_list = load_local_images("data/default")
+    #     target_tuple_list = load_local_images(base_data_path)
 
-    # print(f"--- ШАГ 1: Анализ базовой обстановки ---")
-    # description = describe_satellite_image_Gemini(base_image)
-    # print(f"Описание модели: {description}\n")
+    #     base_image = blank_tuple_list[0][0]
+    #     target_image = target_tuple_list[0][0]
+    # else:
+    #     print("🌐 Fetching maps from GitHub repository...")
+    #     settings_blank = config.REPO_SETTINGS.get("default", {})
+    #     settings_target = config.REPO_SETTINGS.get(folder_name, config.REPO_SETTINGS.get("default", {}))
 
-    # print(f"--- ШАГ 2: Детекция объектов на целевом изображении ---")
-    # objects_to_find = "place for unauthorized festival", "open space"
-    # objects_to_find = "buildings", "warehousesq", "houses"
-    # objects_to_find = "place for oil spill", "place where maybe oil spill is", "open space in water"
-    # objects_to_find = "car accident", "crossroads", "road junction", "road intersection"
-    # objects_to_find = "hogweed thickets", "open space", "field", "meadow"
-    # objects_to_find = resolve_objects_from_query(input("Введите запрос: "))
-    # keypoints = pixelpoint_objects_Gemini(image=base_image, objects=objects_to_find)
-    # print(f"Найдено объектов: {len(keypoints)}, {keypoints}")
+    #     blank_images = fetch_images_from_github(
+    #         repo_owner=settings_blank.get("owner", "grishakalinin2014-alt"),
+    #         repo_name=settings_blank.get("repo", "UAV-Agent"),
+    #         folder_path=settings_blank.get("folder", "images/blank"),
+    #         branch=settings_blank.get("branch", "main")
+    #     )
 
+    #     target_images = fetch_images_from_github(
+    #         repo_owner=settings_target.get("owner", "grishakalinin2014-alt"),
+    #         repo_name=settings_target.get("repo", "UAV-Agent"),
+    #         folder_path=settings_target.get("folder", f"images/{folder_name}"),
+    #         branch=settings_target.get("branch", "main")
+    #     )
 
-    # keypoints = [{'point': [222, 573], 'label': "('House', 'Warehouse')"}]
+    #     base_image = blank_images[0]
+    #     target_image = target_images[0]
 
-    # keypoints = [
-    #     {'point': [518, 496], 'label': 'Warehouse'},
-    #     {'point': [468, 503], 'label': 'Warehouse'},
-    #     {'point': [965, 723], 'label': 'House'}, 
-    #     {'point': [409, 836], 'label': 'House'}, 
-    #     {'point': [428, 829], 'label': 'House'}, 
-    #     {'point': [872, 781], 'label': 'House'}, 
-    #     {'point': [574, 576], 'label': 'House'}, 
-    #     {'point': [617, 706], 'label': 'House'}, 
-    #     {'point': [674, 629], 'label': 'House'}, 
-    #     {'point': [456, 730], 'label': 'House'}]
-    # target_obj = "fire"
-    # target_obj = "hogweed thickets"
-    # target_obj = "unauthorized festival"
-    # target_obj = "oil spill"
-    # target_obj = "cars accident"
-    # print(f"--- ШАГ 3: Визуализация ---")
+    # # 4. Detect waypoints for flight trajectory
+    # print(f"\n--- STEP 3: Detecting reference structures on baseline map ---")
+    # # objects_to_find = resolve_objects_from_query(user_request)
+    # print(f"Target structures: {target_object}")
+
+    # keypoints = pixelpoint_objects_Gemini(image=base_image, objects=target_object) # objects=objects_to_find
+    # print(f"Detected keypoints count: {len(keypoints)}")
+    # print(f"Keypoint coordinates: {keypoints}")
+
+    # if not keypoints:
+    #     print("⚠️ No keypoints detected. Falling back to test coordinates.")
+    #     keypoints = [
+    #         {'point_2d': [180, 220], 'label': 'CheckPoint_1'},
+    #         {'point_2d': [450, 150], 'label': 'CheckPoint_2'},
+    #         {'point_2d': [820, 280], 'label': 'CheckPoint_3'},
+    #         {'point_2d': [290, 480], 'label': 'CheckPoint_4'},
+    #         {'point_2d': [610, 420], 'label': 'CheckPoint_5'},
+    #         {'point_2d': [880, 560], 'label': 'CheckPoint_6'},
+    #         {'point_2d': [150, 750], 'label': 'CheckPoint_7'},
+    #         {'point_2d': [480, 710], 'label': 'CheckPoint_8'},
+    #         {'point_2d': [730, 830], 'label': 'CheckPoint_9'},
+    #         {'point_2d': [340, 910], 'label': 'CheckPoint_10'}
+    #     ]
+
+    # # 5. Flight path visualization
+    # print(f"\n--- STEP 4: Visualizing UAV flight trajectory ---")
     # visualize_keypoints_from_image(image=base_image, keypoints=keypoints)
 
-    # print(f"--- ШАГ 4: Симуляция полета БПЛА ---")
+    # # 6. Flight simulation and frame generation
+    # print(f"\n--- STEP 5: Simulating flight and cropping inspection frames ---")
     # frames_dict = uav_simulation(image=target_image, labeled_points=keypoints)
+    # print(f"Generated inspection frames: {len(frames_dict)}")
 
-    # print(f"--- ШАГ 5: Финальный анализ кадров на наличие {target_obj}  ---")
-    # fire_coords = detect_and_display_Gemini(frames_dict=frames_dict, target_object=target_obj)
+    # # 7. Onboard local model inference
+    # print(f"\n--- STEP 6: Executing local onboard model inference ---")
+    # detected_coords = run_local_uav_detection(
+    #     frames_dict=frames_dict,
+    #     weights_path=weights_path,
+    #     target_object=incident_type
+    # )
 
-    # if fire_coords:
-    #     print(f"\n✅ Миссия завершена: {target_obj} обнаружен в координатах {fire_coords}")
+    # # 8. Summary
+    # print("\n" + "=" * 50)
+    # if detected_coords:
+    #     print(f"🎯 MISSION SUCCESS: Target '{incident_type}' detected at coordinates {detected_coords}")
     # else:
-    #     print(f"\n✅ Миссия завершена: {target_obj} не обнаружен.")
+    #     print(f"✅ MISSION COMPLETE: No occurrences of '{incident_type}' found across frames.")
+    # print("=" * 50)
 
+    # """
+    # Core multi-agent execution pipeline orchestrated by Gemini and smolagents:
+    # - Dynamically loads maps and ground footage.
+    # - Instructs Airspace Manager to parse incoming queries and plan flight paths.
+    # - Partitions and delegates inspection sectors across subordinate UAV agents.
+    # - Gathers and exports detection metrics to CSV.
+    # """
 
+    # litellm.suppress_debug_info = True
 
+    # Register model without 'gemini/' prefix as smolagents expects 'gemini-3.7-flash'
+    # litellm.register_model({
+    #     "gemini-3.7-flash": {
+    #         "max_tokens": 8192,
+    #         "input_cost_per_token": 0.000000075,
+    #         "output_cost_per_token": 0.0000003,
+    #         "litellm_provider": "gemini",
+    #         "mode": "chat",
+    #     },
+    #     "gemini/gemini-3.7-flash": {
+    #         "max_tokens": 8192,
+    #         "input_cost_per_token": 0.000000075,
+    #         "output_cost_per_token": 0.0000003,
+    #         "litellm_provider": "gemini",
+    #         "mode": "chat",
+    #     }
+    # })
 
-    # Инициализация базовой модели через GeminiModel(Gemini 2.5 Flash)
+    litellm.num_retries = 5
+    litellm.retry_strategy = "exponential_backoff_retry"
+
+    # 1. Initialize LLM via OpenAI-compatible proxy gateway
     model = LiteLLMModel(
-        model_id="gemini/gemini-3.5-flash",  
-        api_key=config.GOOGLE_API_KEY,
+        model_id=f"openai/{config.MODEL_ID}",
+        api_key=config.FIREWORKS_API_KEY,
+        api_base="https://ai.starimg.ru/v1",
+        timeout=500,
+        request_timeout=500,
     )
 
-    # Создаем двух агентов
-    uav_agent = create_uav_agent(model)
-    airspace_manager_agent = create_airspace_manager(model, uav_agent)
+    counter_drones = config.COUNTER_DRONES
 
-    # Выбор сценария
-    print("Доступные сценарии:", list(COMMANDS.keys()))
-    selected_key = input("Введите ключ сценария (или нажмите Enter для тестирования 'fire'): ").strip()
-    if not selected_key or selected_key not in COMMANDS:
-        selected_key = "fire"
-        
-    user_request = COMMANDS[selected_key]
-    print(f"\n📝 Выбран запрос: '{user_request}'")
+    # 2. Initialize swarm agents
+    uav_agents = [
+        create_uav_agent(model, drone_id=i) for i in range(counter_drones)
+    ]
+    airspace_manager_agent = create_airspace_manager(model, uav_agents)
+    drone_names = [agent.name for agent in uav_agents]
+    drones_code_repr = f"[{', '.join(drone_names)}]"
+
+    # 3. Scenario resolution
+    print("list of scenarios:", list(COMMANDS.keys()))
+    user_input = input(
+        "Enter key or query text (Press Enter for default fire scenario): "
+    ).strip()
+
+    # Automatically resolve scenario by keywords
+    scenario = resolve_scenario(user_input, COMMANDS)
+
+    print(f"\n✅ Scenario: '{scenario['incident_type']}'")
+    print(f"📁 Folder: data/{scenario['folder']}")
+    print(f"🎯 Target Object: {scenario['target_object']}")
+    print(f"📝 Request: {scenario['request']}\n")
 
     repo_owner = "grishakalinin2014-alt"
     repo_name = "UAV-Agent"
     branch = "main"
 
-    results = []
+    # 4. Batch experiment setup
+    total_experiments = 30
+    base_experiments_dir = "experiments"
+    os.makedirs(base_experiments_dir, exist_ok=True)
 
-    # Цикл бенчмарка из ваших примеров (5 итераций экспериментов)
-    for i in range(0, 5):
-        print(f"\n=== 🏁 ЗАПУСК ЭКСПЕРИМЕНТА №{i} ===")
+    csv_file_path = os.path.join(
+        base_experiments_dir, f"experiment_results_{scenario['incident_type']}.csv"
+    )
+    fieldnames = [
+        "Experiment Number",
+        "Home Point",
+        "Folder",
+        "Scenario",
+        "Request Text",
+        "Elapsed Time",
+        "Agent Time (s)", 
+        "Flight Time (s)",  
+        "Total Mission Time (s)",
+        # "Outcome",
+    ]
+
+    # Initialize CSV file with headers if it does not exist
+    if not os.path.exists(csv_file_path):
+        with open(csv_file_path, mode="w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer.writeheader()
+
+    # 4. Run experiment iteration
+    for i in range(20, total_experiments + 1):
+        exp_folder = os.path.join(base_experiments_dir, f"exp_{i}")
+        os.makedirs(exp_folder, exist_ok=True)
+        os.environ["CURRENT_EXP_DIR"] = exp_folder
+        tools._SWARM_TRAJECTORIES.clear()
+        tools.SWARM_FLIGHT_TIMES.clear()
+
+        rng = random.Random(42 + i)
+        side = rng.choice(["top", "bottom", "left", "right"])
+        if side == "top":
+            home_point = (rng.randint(60, 950), 60)
+        elif side == "bottom":
+            home_point = (rng.randint(60, 950), 950)
+        elif side == "left":
+            home_point = (60, rng.randint(60, 950))
+        else:  
+            home_point = (950, rng.randint(60, 950))
+
+        print(f"\n=== 🏁 START EXPERIMENT №{i} / {total_experiments} ===")
+        print(f"📁 Output Directory: {exp_folder}")
         start_time = time.time()
 
-        # Формируем динамическую инструкцию для Менеджера
-        # Формируем полностью динамическую инструкцию для Менеджера
+        user_request_text = f"{scenario['request']} Inspect target map index #{i}."
+
+        # Reset memory state to prevent token context accumulation across runs
+        if hasattr(airspace_manager_agent, "memory"):
+            airspace_manager_agent.memory.reset()
+        for drone in uav_agents:
+            if hasattr(drone, "memory"):
+                drone.memory.reset()
+
+        # Invalidate cached executor state for the current run
+        airspace_manager_agent.python_executor.state["output_dir"] = exp_folder
+
         task_prompt = f"""
-        You are an intelligent Airspace Manager. Your job is to analyze the user's request, download maps and target images dynamically from GitHub, find infrastructure coordinates on a baseline map, and coordinate a UAV verification flight.
+    You are an AI agent managing a UAV flight inspection system.
+    
+    Available tools for reference:
+        uav_agents:
+        tools=[
+            run_local_uav_detection,
+            detect_and_display
+        ]
+    
+        airspace_manager:
+        tools=[
+            get_folder_by_query,
+            pixelpoint_objects,
+            visualize_keypoints_from_image,
+            fetch_images_from_github,
+            download_and_sync_weights,
+            extract_inspection_targets,
+            load_local_map_images
+        ]
 
-        User Request: "{user_request}"
-        Current Experiment Index (Image Index to process): {i}
-        
-        GitHub Repository Configuration:
-        - Owner: "{repo_owner}"
-        - Repo Name: "{repo_name}"
-        - Branch: "{branch}"
-        - Baseline Folder: "images/blank"
+    CRITICAL OPERATIONAL RULES (STRICT COMPLIANCE):
+    - Every action must strictly contain Python code enclosed between <code> and </code> tags. 
+    - Do not mix natural language thoughts inside the <code> block.
+    - Do NOT save intermediate variables to JSON and do NOT use the `open()` function.
+    - Coordinate System: Use a strict normalized integer grid from 0 to 1000, where (x=0, y=0) is the absolute top-left corner and (x=1000, y=1000) is the bottom-right corner.
+    - Keep all variables (keypoints, weights_path, target_object, images) in RAM! They are automatically preserved between code execution stages.
+    - Do NOT use `open()`, `eval()`, or `exec()` functions.
+    - Do NOT use Python introspection functions such as `globals()`, `locals()`, `dir()`, `eval()`, or `exec()`.
+    - Use only functions already defined within the created agents.
+    - Do NOT run the entire workflow inside a single massive Python code block.
+    - Output ONLY 1 short code block per stage, verify the result, and then proceed to the next stage.
+    - You MUST perform actions by WRITING AND EXECUTING CORRECT PYTHON CODE.
+    - Each stage MUST contain a Python code block in Markdown format:
+    ```python
 
-        Follow this execution plan precisely in your generated Python code:
-        1. Download BASELINE images from GitHub using the 'fetch_images_from_github' tool with owner, repo, branch, and folder="images/blank".
-           Select the {i}-th image as your clean reference map: baseline_image = baseline_images[{i}].
-        
-        2. Call 'get_folder_by_query' with the User Request. Use the 'json' module to parse the resulting JSON string:
-           import json
-           incident_data = json.loads(get_folder_by_query("{user_request}"))
-           folder = incident_data["folder"]
-           target_object = incident_data["target_object"]
-           incident_type = incident_data["incident_type"]
-           CRITICAL: Pass the user request string strictly as a positional argument or using the exact parameter name 'user_query', like this: get_folder_by_query(user_query="{user_request}").
-        
-        3. Determine the TARGET GitHub folder path. Map the extracted folder name strictly to the repository structure:
-           - If folder is "fire", the target GitHub folder path is "images/fire_buildings".
-           - If folder is "hogweed_thickets", the target GitHub folder path is "images/hogweed_thickets".
-           - For any other folder, use the exact "images/" + folder_name structure.
-        
-        4. Call 'resolve_objects_from_query' with the User Request to get the types of static infrastructure objects to inspect (e.g., crossroads, buildings).
-        5. Pass 'baseline_image' and the infrastructure objects string to 'pixelpoint_objects_Gemini' to detect coordinates on the clean map.
-        6. Visualize these detected keypoints ON THE BASELINE IMAGE using 'visualize_keypoints_from_image(image=baseline_image, keypoints=...)'.
-        
-       7. MANDATORY UAV DELEGATION (CRITICAL): 
-           You MUST ALWAYS execute the dynamic flight verification workflow for EVERY single incident type, including static ones (such as hogweed thickets, infrastructure damage, trash piles, etc.). NEVER skip this step or complete the task based only on the baseline map.
-           
-           Call 'uav_agent' by providing a text prompt containing:
-           - The exact target folder path on GitHub (e.g., "images/fire_buildings" or the folder mapped in Step 3).
-           - The target image index to process (which is {i}).
-           - The 'target_object' name to search for (e.g., extracted "target_object" from Step 2).
-           - The generated coordinates array (keypoints) from Step 5.
-           
-           Instruct the 'uav_agent' to precisely write and run this Python code structure:
-           a) Download the target images from GitHub using 'fetch_images_from_github'.
-           b) Select the target_image = target_images[{i}].
-           c) Generate the frames dictionary: frames_dict = uav_simulation(image=target_image, labeled_points=keypoints).
-           d) Pass the 'frames_dict' entirely into 'detect_and_display_Gemini' without ANY manual 'for' loops over individual frames.
-           e) Immediately return the resulting coordinates or status to you.
+    - Do NOT write text-based plans, overviews, or summaries without code.
+    - Always use executable code blocks to call functions.
 
-        8. FINAL ANSWER FORMULATION:
-           Formulate your final answer ONLY after the uav_agent completes the dynamic flight verification and returns the frame-by-frame detection results.
-        Provide the final coordinates or a verification summary as your final answer.
-        """
+    TASK CONFIGURATION:
+    User request: "{user_input}"
+    Experiment index: {i}
+    counter_drones: {counter_drones}
+    GitHub configuration: Repo_owner="{repo_owner}", repo_name="{repo_name}", branch="{branch}"
 
+    CRITICAL WORKFLOW RULES:
+    1. IMAGES ROLES:
+    - `load_local_map_images()` returns a tuple: `base_image, target_image`.
+    - `base_image` is an ARCHIVAL reference map without incidents. Use it ONLY with `pixelpoint_objects` to find infrastructure/waypoints (e.g. houses, buildings, roads).
+    - `target_image` represents the REAL-TIME physical ground with the ongoing incident. Pass it ONLY to `uav_simulation()` to generate the drone camera feed.
+    - NEVER call `pixelpoint_objects` on `target_image`! That is cheating and strictly forbidden.
+    - In `pixelpoint_objects`, do NOT search for the disaster itself (e.g., do NOT search for 'fire'). Search for candidate structures to inspect (e.g., 'residential buildings', 'houses').
+    - DO NOT inspect function internals, source code, or dunder attributes (e.g., `__code__`, `__globals__`, `dir()`).
+    - Call tools directly with the specified signature without introspecting them.
+
+    2. TASK EXECUTION SEQUENCE:
+    Step 1: Extract candidate inspection structures using `inspection_targets = extract_inspection_targets(user_request)`. (These must be structures/places to check, e.g. buildings/forest).
+    Step 2: Determine scenario details:
+        `folder_info = get_folder_by_query(user_request)`
+        `target_object = extract_inspection_targets(user_request)`
+    Step 3: Load map images and weights for the experiment:
+        `base_image, target_image = load_local_map_images(folder_name=folder_info['folder'], index={i})`
+        `weights_path = download_and_sync_weights(folder_info['incident_type'])`
+    Step 4: Extract keypoints in coordinat from archival base map: `keypoints = pixelpoint_objects(image=base_image, objects=inspection_targets)`
+    Step 5: Show the flight path and keypoints on the base map using `visualize_keypoints_from_image(image=base_image, keypoints=keypoints, output_dir="{exp_folder}")`.
+    Step 6: Partition inspection keypoints, simulate realistic flight for each drone with GIF generation, execute parallel reconnaissance scanning, and submit report:
+
+    ```python
+    import math
+    from concurrent.futures import ThreadPoolExecutor
+
+    drones = {drones_code_repr}
+    num_drones = len(drones)
+    home_point = {home_point}
+    output_dir = "{exp_folder}"
+
+    # 1. Coordinate normalization
+    def get_xy(p):
+        if isinstance(p, dict):
+            if "point_2d" in p:
+                return p["point_2d"][0], p["point_2d"][1]
+            return p.get("x", 0), p.get("y", 0)
+        return p[0], p[1]
+
+    # 2. Greedy Nearest Neighbor route optimization (TSP heuristic)
+    def optimize_route(home, points):
+        if not points:
+            return []
+
+        unvisited = list(points)
+        current_pos = home
+        optimized_path = []
+
+        while unvisited:
+            nearest_idx = min(
+                range(len(unvisited)),
+                key=lambda idx: (get_xy(unvisited[idx])[0] - current_pos[0]) ** 2
+                + (get_xy(unvisited[idx])[1] - current_pos[1]) ** 2,
+            )
+            next_point = unvisited.pop(nearest_idx)
+            optimized_path.append(next_point)
+            current_pos = get_xy(next_point)
+
+        return optimized_path
+
+    # 3. Balance points
+    def balance_routes_by_time(home, points, num_drones):
+      if not points:
+        return [[] for _ in range(num_drones)]
+
+      assigned_routes = [[] for _ in range(num_drones)]
+
+      def get_route_dist(route):
+        if not route:
+          return 0.0
+        pts = [home] + [get_xy(p) for p in route] + [home]
+        return sum(
+            math.hypot(pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1])
+            for k in range(1, len(pts))
+        )
+
+      sorted_pts = sorted(
+          points,
+          key=lambda p: math.hypot(
+              get_xy(p)[0] - home[0], get_xy(p)[1] - home[1]
+          ),
+          reverse=True,
+      )
+
+      for pt in sorted_pts:
+        best_drone = min(
+            range(num_drones),
+            key=lambda i: get_route_dist(assigned_routes[i] + [pt]),
+        )
+        assigned_routes[best_drone].append(pt)
+
+      return assigned_routes
+
+    drone_point_groups = balance_routes_by_time(
+        home_point, keypoints, len(drones)
+    )
+    drone_tasks = []
+
+    # 4. Local TSP-optim
+    for idx, drone in enumerate(drones):
+      assigned_points = drone_point_groups[idx]
+      optimized_points = optimize_route(home_point, assigned_points)
+
+      if optimized_points:
+        drone_frames = uav_simulation(
+            image=target_image,
+            labeled_points=optimized_points,
+            drone_id=idx,
+            total_drones=num_drones,
+            home_point=home_point,
+            output_dir=output_dir,
+        )
+        drone_tasks.append((drone, drone_frames, idx))
+
+    # 5. Parallel reconnaissance worker
+    def execute_drone_sector(drone, frames, drone_idx):
+        drone.python_executor.state["frames_dict"] = frames
+        drone.python_executor.state["target_object"] = target_object
+        drone.python_executor.state["weights_path"] = weights_path
+
+        if weights_path:
+            task_command = (
+                "Call run_local_uav_detection(frames_dict=frames_dict, "
+                "weights_path=weights_path, target_object=target_object) EXACTLY ONCE. "
+                "Return the result via final_answer(...) as code. Do not output raw JSON."
+            )
+        else:
+            task_command = (
+                "Call detect_and_display(frames_dict=frames_dict, "
+                "target_object=target_object) EXACTLY ONCE. "
+                "Return the result via final_answer(...) as code. Do not output raw JSON."
+            )
+
+        drone_name = getattr(drone, "name", f"uav_agent_{{drone_idx}}")
+        return drone_name, drone(task_command)
+
+    futures = []
+    with ThreadPoolExecutor(max_workers=len(drone_tasks)) as executor:
+        for drone, frames, idx in drone_tasks:
+            futures.append(executor.submit(execute_drone_sector, drone, frames, idx))
+
+    all_drone_results = dict(f.result() for f in futures)
+    print("Reconnaissance results from drones:", all_drone_results)
+
+    final_answer(
+        f"Multi-UAV reconnaissance successfully executed. Drone outcomes: {{all_drone_results}}"
+    )
+    ```
+
+    Try to complete the task and detect incidents—after all, you could save lives!
+    """
+        
         try:
-            # Запуск цепочки через главного агента
             experiment_outcome = airspace_manager_agent.run(task_prompt)
         except Exception as e:
-            experiment_outcome = f"Execution failed with error: {str(e)}"
-            print(f"❌ Ошибка на итерации {i}: {e}")
+            experiment_outcome = f"Execution failed: {str(e)}"
+            print(f"❌ Error on experiment #{i}: {e}")
 
         elapsed_time = time.time() - start_time
-        print(f"⏱️ Эксперимент {i} завершен за {elapsed_time:.2f} сек.")
-
-        results.append({
-            'Experiment Number': i,
-            'Scenario': selected_key,
-            'Request Text': user_request,
-            'Elapsed Time': f"{elapsed_time:.2f}",
-            'Outcome': experiment_outcome
-        })
-
-    # Сохраняем логи в CSV-файл по завершении итераций
-    csv_file_path = f'experiment_results_{selected_key}.csv'
-    fieldnames = ['Experiment Number', 'Scenario', 'Request Text', 'Elapsed Time', 'Outcome']
-
-    with open(csv_file_path, mode='w', newline='', encoding='utf-8') as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()
-        for res in results:
-            writer.writerow(res)
-
-    print(f"\n📊 Все эксперименты завершены! Данные сохранены в {csv_file_path}")
+        print(f"⏱️ Experiment {i} completed in {elapsed_time:.2f}s.")
 
 
+        # time mission
+        flight_time = max(SWARM_FLIGHT_TIMES.values()) if SWARM_FLIGHT_TIMES else 0.0
+        total_time = elapsed_time + flight_time
+
+        agent_time = time.time() - start_time
+
+        print(
+            f"⏱️ Experiment {i} completed in {elapsed_time:.2f}s (Agent) + {flight_time:.2f}s (Flight) = {total_time:.2f}s Total."
+        )
+
+        # clear dictionary
+        SWARM_FLIGHT_TIMES.clear()
+
+        # Save individual experiment report to its designated folder
+        report_file_path = os.path.join(exp_folder, "report.txt")
+        with open(report_file_path, mode="w", encoding="utf-8") as rf:
+            rf.write(f"Experiment Index: {i}\n")
+            rf.write(f"Artifacts Folder: {exp_folder}\n")
+            rf.write(f"Scenario: {scenario['incident_type']}\n")
+            rf.write(f"Request: {user_request_text}\n")
+            rf.write(f"Elapsed Time: {elapsed_time:.2f} s\n")
+            rf.write(f"Agent Time: {agent_time:.2f} s\n")
+            rf.write(f"Flight Time: {flight_time:.2f} s\n")
+            rf.write(f"Total Mission Time: {total_time:.2f} s\n")
+            # rf.write(f"Outcome:\n{experiment_outcome}\n")
+
+        # Append row to the master CSV log
+        record = {
+            "Experiment Number": i,
+            "Home Point": str(home_point),
+            "Folder": exp_folder,
+            "Scenario": scenario["incident_type"],
+            "Request Text": user_request_text,
+            "Elapsed Time": f"{elapsed_time:.2f}",
+            "Agent Time (s)": f"{agent_time:.2f}",
+            "Flight Time (s)": f"{flight_time:.2f}",
+            "Total Mission Time (s)": f"{total_time:.2f}",
+            # "Outcome": str(experiment_outcome),
+        }
+
+        with open(csv_file_path, mode="a", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer.writerow(record)
+
+        # Flush telemetry exporter
+        try:
+            tracer_provider.force_flush()
+        except Exception:
+            pass
+
+        time.sleep(1)
+
+    print(
+        f"\n📊 All {total_experiments} experiments completed! Results logged in {csv_file_path}"
+    )
 
 if __name__ == "__main__":
     main()
