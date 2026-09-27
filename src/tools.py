@@ -663,7 +663,7 @@ def detect_and_display(
     target_object: str,
     output_dir: Optional[str] = None,
 ) -> List[Tuple[int, int]]:
-    """Detects target objects across UAV camera frames and logs confirmed detection artifacts.
+    """Detects target objects across UAV camera frames and saves annotated plots.
 
     Args:
         frames_dict: Dictionary mapping frame identifiers to tuples of (PIL Image, (x, y) coordinates).
@@ -694,8 +694,10 @@ def detect_and_display(
         f"{len(selected_frames)} candidate frames into directory: {target_dir}..."
     )
 
-    detected_records = []
-    records_lock = threading.Lock()
+    safe_target_name = "".join(
+        c if c.isalnum() or c in ("-", "_") else "_" for c in target_object
+    )
+    plot_lock = threading.Lock()
 
     # 2. Parallel frame evaluation via ThreadPoolExecutor
     def process_single_frame(frame_data):
@@ -704,7 +706,7 @@ def detect_and_display(
         img.save(buffered, format="JPEG", quality=85)
         img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-        prompt = f"Do you see any {target_object}? Answer ONLY with 'YES' or 'NO'."
+        prompt = f"Do you see any {target_object} on the picture? Answer ONLY with 'YES' or 'NO'."
         data = {
             "model": config.MODEL_ID,
             "messages": [
@@ -721,7 +723,7 @@ def detect_and_display(
                     ],
                 }
             ],
-            "temperature": getattr(config, "TEMPERATURE", 0.0),
+            "temperature": getattr(config, "TEMPERATURE", 0.5),
         }
 
         try:
@@ -738,16 +740,20 @@ def detect_and_display(
                         f"🎯 Target '{target_object}' confirmed at coordinates {coords} in {frame_name}"
                     )
                     save_path = os.path.join(
-                        target_dir, f"{target_object}_{frame_name}.png"
+                        target_dir, f"detected_{safe_target_name}_{frame_name}.png"
                     )
-                    img.save(save_path)
 
-                    with records_lock:
-                        detected_records.append({
-                            "frame": frame_name,
-                            "coordinates": coords,
-                            "file_path": save_path,
-                        })
+                    # Save figure with title and coordinates matching the reference layout
+                    with plot_lock:
+                        fig, ax = plt.subplots(figsize=(6, 6))
+                        ax.imshow(img)
+                        ax.set_title(
+                            f"Coords: {coords}"
+                        )
+                        ax.axis("off")
+                        fig.savefig(save_path, bbox_inches="tight")
+                        plt.close(fig)
+
                     return coords
         except Exception:
             pass
@@ -758,25 +764,6 @@ def detect_and_display(
         results = list(executor.map(process_single_frame, selected_frames))
 
     detected_coordinates = [c for c in results if c is not None]
-
-    # 4. Export structured detection summary JSON
-    summary_path = os.path.join(target_dir, f"detections_{target_object}.json")
-    try:
-        with open(summary_path, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "target_object": target_object,
-                    "total_inspected_frames": len(selected_frames),
-                    "detections_count": len(detected_coordinates),
-                    "detections": detected_records,
-                },
-                f,
-                indent=2,
-                ensure_ascii=False,
-            )
-        print(f"📁 Structured verification log saved to: {summary_path}")
-    except Exception as e:
-        print(f"Warning: Failed to export detection log: {e}")
 
     print(
         f"\n✅ Visual inspection completed. Confirmed target locations: {len(detected_coordinates)}"
