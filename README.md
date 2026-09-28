@@ -51,25 +51,25 @@ The system orchestrates autonomous reconnaissance across large geographic areas 
 ## ⚙️ Installation
 
 ## 1. Clone RepositoryBash
-# git clone https://github.com/Sautenich/UAV-CodeAgents.git
-# cd UAV-CodeAgents
+git clone https://github.com/Sautenich/UAV-CodeAgents.git
+cd UAV-CodeAgents
 
-# 2. Environment SetupBash
-# python3 -m venv venv
-# source venv/bin/activate
-# pip install -r requirements.txt
+## 2. Environment SetupBash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 
-# 3. API Credentials
-# Configure environment variables for model inference in config.py:
-# FIREWORKS_API_KEY="your_fireworks_api_key"
-# MODEL_ID="gemini-3.8-flash"
-# OPENROUTER_BASE_URL="your_URL_api"
+## 3. API Credentials
+Configure environment variables for model inference in config.py:
+FIREWORKS_API_KEY="your_fireworks_api_key"
+MODEL_ID="gemini-3.8-flash"
+OPENROUTER_BASE_URL="your_URL_api"
 
 ## 🚀 Running MissionsRun autonomous mission planning and reconnaissance across scenarios:
-# Start code
-# python3 main.py
-# Scenario selection
-# for example: I need to check at home, one of them might be on fire right now.
+## Start code
+python3 main.py
+Scenario selection
+for example: I need to check at home, one of them might be on fire right now.
 
 ## 🛠️ Key Agent Tools
 fetch_images_from_github: load dataset from GitHub.
