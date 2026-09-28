@@ -2,6 +2,8 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2505.07236-b31b1b.svg)](https://arxiv.org/abs/2505.07236)
 
+This repository contains the official codebase and experimental framework for **UAV-CodeAgents**, a hierarchical multi-agent framework for scalable UAV mission planning and target reconnaissance using Vision-Language Models (VLMs) and the ReAct paradigm.
+
 ### The code will be published soon.
 
 The video:
