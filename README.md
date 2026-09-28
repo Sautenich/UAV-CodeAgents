@@ -81,13 +81,21 @@ for example: I need to check at home, one of them might be on fire right now.
 
 ## 🛠️ Key Agent Tools
 fetch_images_from_github: load dataset from GitHub.
+
 load_local_map_images: load dataset from local folder.
+
 download_and_sync_weights: checks for the presence of the weights required for the mission.
+
 extract_inspection_targets: identifies keywords for searching within the satellite image.
+
 pixelpoint_objects: sends a request to generate coordinates for the drone at key locations.
+
 visualize_keypoints_from_image: visualizes the placed points.
+
 uav_simulation: create visualize simulation of drones fly.
+
 detect_and_display: analyzes for fire using an LLM.
+
 run_local_uav_detection: analyzes for fire using an weight.
 
 ## Citation
