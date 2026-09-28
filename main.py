@@ -379,7 +379,7 @@ def main():
             writer.writeheader()
 
     # 4. Run experiment iteration
-    for i in range(20, total_experiments + 1):
+    for i in range(1, total_experiments + 1):
         exp_folder = os.path.join(base_experiments_dir, f"exp_{i}")
         os.makedirs(exp_folder, exist_ok=True)
         os.environ["CURRENT_EXP_DIR"] = exp_folder
