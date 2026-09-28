@@ -23,7 +23,7 @@ COUNTER_DRONES = 3
 
 # API credentials and endpoint for proxy/gateway service (Fireworks / Starimg / OpenRouter)
 FIREWORKS_API_KEY = os.getenv("MY_KEY")
-MODEL_ID = "gpt-6-sol"
+MODEL_ID = "gemini-3.8-flash"
 OPENROUTER_BASE_URL = "https://ai.starimg.ru/v1/chat/completions"
 
 # Google Gemini API credentials and direct service endpoints
