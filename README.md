@@ -79,9 +79,8 @@ python3 main.py
 
 for example: I need to check at home, one of them might be on fire right now.
 
+## 🛠️ Key Agent Tools
 <div align="center">
-
-### TABLE I: TOOLS AND FUNCTIONALITIES OF CODEAGENT AND UAV AGENT
 
 <table>
   <thead>
@@ -94,67 +93,52 @@ for example: I need to check at home, one of them might be on fire right now.
   <tbody>
     <!-- Airspace Manager Agent -->
     <tr>
-      <td rowspan="5"><b>Airspace Manager Agent</b></td>
-      <td><code>read_image</code></td>
-      <td>Returns a PIL image object for airspace analysis.<br><i>Arguments:</i> <code>i</code> (integer) - image index</td>
+      <td rowspan="7"><b>Airspace Manager Agent</b></td>
+      <td><code>fetch_images_from_github</code></td>
+      <td>Loads dataset directly from GitHub repository.<br><i>Arguments:</i> <code>repo_url</code> (string), <code>target_dir</code> (string)</td>
     </tr>
     <tr>
-      <td><code>describe_satellite_image</code></td>
-      <td>Analyzes image using Qwen2.5-VL via Fireworks API.<br><i>Arguments:</i> <code>image</code> (PIL.Image) - image to process</td>
+      <td><code>load_local_map_images</code></td>
+      <td>Loads operational satellite map imagery from a local folder.<br><i>Arguments:</i> <code>data_dir</code> (string), <code>scenario</code> (string)</td>
+    </tr>
+    <tr>
+      <td><code>download_and_sync_weights</code></td>
+      <td>Checks for the presence of the model weights required for the mission.<br><i>Arguments:</i> <code>weights_path</code> (string)</td>
+    </tr>
+    <tr>
+      <td><code>extract_inspection_targets</code></td>
+      <td>Identifies semantic keywords and target categories for satellite image search.<br><i>Arguments:</i> <code>task_description</code> (string)</td>
     </tr>
     <tr>
       <td><code>pixelpoint_objects</code></td>
-      <td>Extracts objects with Qwen2.5-VL, auto-repairs JSON.<br><i>Arguments:</i> <code>image</code> (PIL.Image), <code>objects</code> (string)</td>
+      <td>Sends requests to extract metric 2D coordinates for drone navigation at key locations.<br><i>Arguments:</i> <code>image</code> (PIL.Image), <code>objects</code> (string)</td>
     </tr>
     <tr>
-      <td><code>visualize_keypoints</code></td>
-      <td>Renders labeled objects on image with bounding boxes.<br><i>Arguments:</i> <code>image</code> (PIL.Image), <code>keypoints</code> (list)</td>
+      <td><code>visualize_keypoints_from_image</code></td>
+      <td>Visualizes the placed inspection target points and trajectory on the base terrain image.<br><i>Arguments:</i> <code>image</code> (PIL.Image), <code>keypoints</code> (list)</td>
     </tr>
     <tr>
       <td><code>final_answer</code></td>
-      <td>Delivers processed results to user.<br><i>Arguments:</i> <code>answer</code> (any type)</td>
+      <td>Delivers finalized mission trajectory plan and results to user.<br><i>Arguments:</i> <code>answer</code> (any type)</td>
     </tr>
     <!-- UAV Agent -->
     <tr>
-      <td rowspan="4"><b>UAV Agent</b></td>
-      <td><code>read_image_for_simulation</code></td>
-      <td>Provides image for UAV flight simulation.<br><i>Arguments:</i> <code>i</code> (integer) - simulation index</td>
-    </tr>
-    <tr>
+      <td rowspan="3"><b>UAV Agent</b></td>
       <td><code>uav_simulation</code></td>
-      <td>Simulates flight path and captures frames.<br><i>Arguments:</i> <code>image</code> (PIL.Image), <code>labeled_points</code> (list)</td>
+      <td>Simulates UAV flight path and captures stream frames.<br><i>Arguments:</i> <code>image</code> (PIL.Image), <code>labeled_points</code> (list)</td>
     </tr>
     <tr>
-      <td><code>detect_and_display</code></td>
-      <td>Identifies fire locations in UAV footage.<br><i>Arguments:</i> <code>frames_dict</code> (dictionary)</td>
+      <td><code>run_local_uav_detection</code></td>
+      <td>Executes onboard frame scanning and target detection using neural network weights.<br><i>Arguments:</i> <code>frames_dict</code> (dict), <code>weights_path</code> (string), <code>target_object</code> (string)</td>
     </tr>
     <tr>
       <td><code>final_answer</code></td>
-      <td>Returns detection results.<br><i>Arguments:</i> <code>answer</code> (any type)</td>
+      <td>Returns confirmed target detections and metric coordinates.<br><i>Arguments:</i> <code>answer</code> (any type)</td>
     </tr>
   </tbody>
 </table>
 
 </div>
-
-## 🛠️ Key Agent Tools
-fetch_images_from_github: load dataset from GitHub.
-
-load_local_map_images: load dataset from local folder.
-
-download_and_sync_weights: checks for the presence of the weights required for the mission.
-
-extract_inspection_targets: identifies keywords for searching within the satellite image.
-
-pixelpoint_objects: sends a request to generate coordinates for the drone at key locations.
-
-visualize_keypoints_from_image: visualizes the placed points.
-
-uav_simulation: create visualize simulation of drones fly.
-
-detect_and_display: analyzes for fire using an LLM.
-
-run_local_uav_detection: analyzes for fire using an weight.
 
 ## Citation
 
