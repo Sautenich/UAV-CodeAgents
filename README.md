@@ -79,6 +79,64 @@ python3 main.py
 
 for example: I need to check at home, one of them might be on fire right now.
 
+<div align="center">
+
+### TABLE I: TOOLS AND FUNCTIONALITIES OF CODEAGENT AND UAV AGENT
+
+<table>
+  <thead>
+    <tr style="background-color: #e6e6e6;">
+      <th align="left">Agent</th>
+      <th align="left">Tool Name</th>
+      <th align="left">Description and Arguments</th>
+    </tr>
+  </thead>
+  <tbody>
+    <!-- Airspace Manager Agent -->
+    <tr>
+      <td rowspan="5"><b>Airspace Manager Agent</b></td>
+      <td><code>read_image</code></td>
+      <td>Returns a PIL image object for airspace analysis.<br><i>Arguments:</i> <code>i</code> (integer) - image index</td>
+    </tr>
+    <tr>
+      <td><code>describe_satellite_image</code></td>
+      <td>Analyzes image using Qwen2.5-VL via Fireworks API.<br><i>Arguments:</i> <code>image</code> (PIL.Image) - image to process</td>
+    </tr>
+    <tr>
+      <td><code>pixelpoint_objects</code></td>
+      <td>Extracts objects with Qwen2.5-VL, auto-repairs JSON.<br><i>Arguments:</i> <code>image</code> (PIL.Image), <code>objects</code> (string)</td>
+    </tr>
+    <tr>
+      <td><code>visualize_keypoints</code></td>
+      <td>Renders labeled objects on image with bounding boxes.<br><i>Arguments:</i> <code>image</code> (PIL.Image), <code>keypoints</code> (list)</td>
+    </tr>
+    <tr>
+      <td><code>final_answer</code></td>
+      <td>Delivers processed results to user.<br><i>Arguments:</i> <code>answer</code> (any type)</td>
+    </tr>
+    <!-- UAV Agent -->
+    <tr>
+      <td rowspan="4"><b>UAV Agent</b></td>
+      <td><code>read_image_for_simulation</code></td>
+      <td>Provides image for UAV flight simulation.<br><i>Arguments:</i> <code>i</code> (integer) - simulation index</td>
+    </tr>
+    <tr>
+      <td><code>uav_simulation</code></td>
+      <td>Simulates flight path and captures frames.<br><i>Arguments:</i> <code>image</code> (PIL.Image), <code>labeled_points</code> (list)</td>
+    </tr>
+    <tr>
+      <td><code>detect_and_display</code></td>
+      <td>Identifies fire locations in UAV footage.<br><i>Arguments:</i> <code>frames_dict</code> (dictionary)</td>
+    </tr>
+    <tr>
+      <td><code>final_answer</code></td>
+      <td>Returns detection results.<br><i>Arguments:</i> <code>answer</code> (any type)</td>
+    </tr>
+  </tbody>
+</table>
+
+</div>
+
 ## 🛠️ Key Agent Tools
 fetch_images_from_github: load dataset from GitHub.
 
