@@ -1,11 +1,25 @@
-.env
-.venv/
-__pycache__/
-*.db
-*.sqlite3
-data/.vscode/
-.vscode/
-*.db
-__pycache__/
+# Secrets
 .env
 service-key.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editors
+.vscode/
+.idea/
+
+# Model weights (download them, see README)
+models/
+*.onnx
+*.pt
+*.safetensors
+
+# Run outputs
+experiments/
+uav_logs/
+*.db
+*.sqlite3

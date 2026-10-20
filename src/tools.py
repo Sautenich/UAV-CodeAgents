@@ -1,28 +1,22 @@
 """Tools and perception modules for the UAV-CodeAgents multi-agent framework.
 
 Provides ReAct tools for aerial visual grounding, aspect-ratio-invariant coordinate
-projection, multi-UAV flight simulation, edge-assisted target verification,
-and multimodal incident classification.
+projection, multi-UAV flight simulation, and scenario resolution.
 """
 
 import ast
 import base64
 from concurrent.futures import ThreadPoolExecutor
-from io import BytesIO
 import io
 import json
+import math
 import os
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
-from google import genai
-from google.genai import Client, types
-from google.oauth2 import service_account
-import imageio
-from IPython.display import Image as IPImage, display
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -38,21 +32,73 @@ import config
 # Global buffer to synchronize concurrent flight tracks across active UAVs
 _SWARM_TRAJECTORIES: Dict[int, List[Tuple[int, int]]] = {}
 SWARM_FLIGHT_TIMES: Dict[int, float] = {}
+# Confirmed detections of the current mission, keyed by drone index
+SWARM_DETECTIONS: Dict[int, List[Dict[str, Any]]] = {}
 _SWARM_LOCK = threading.Lock()
 CURRENT_OUTPUT_DIR: Optional[str] = None
 
-# Inference parameter defaults
-Temp = 0.5
-model = config.MODEL_ID
-path = config.OPENROUTER_BASE_URL
+
+def reset_swarm_state() -> None:
+    """Clears trajectories, flight times, and detections before a new mission."""
+    with _SWARM_LOCK:
+        _SWARM_TRAJECTORIES.clear()
+        SWARM_FLIGHT_TIMES.clear()
+        SWARM_DETECTIONS.clear()
+
+
+def record_detections(drone_id: int, detections: List[Dict[str, Any]]) -> None:
+    """Stores confirmed detections of one drone for mission reporting.
+
+    Args:
+        drone_id: Index of the reporting UAV.
+        detections: Dictionaries with 'frame', 'coords' and 'probability'.
+    """
+    with _SWARM_LOCK:
+        SWARM_DETECTIONS.setdefault(drone_id, []).extend(detections)
+
+
+def get_swarm_detections() -> Dict[int, List[Dict[str, Any]]]:
+    """Returns a snapshot of the detections recorded during the current mission."""
+    with _SWARM_LOCK:
+        return {drone_id: list(items) for drone_id, items in SWARM_DETECTIONS.items()}
+
+
+# Pixel keypoints and map size of the latest `pixelpoint_objects` call
+_LAST_GROUNDING: Dict[str, Any] = {}
+
+
+def ensure_pixel_keypoints(keypoints: List[Any]) -> List[Any]:
+    """Returns keypoints in map pixels, undoing a rescaling to the normalized grid.
+
+    All tools work in pixel coordinates of the map. If the agent converted the
+    output of `pixelpoint_objects` to the 0..GROUNDING_GRID_SIZE range, the
+    original pixel keypoints are restored and a warning is printed.
+    """
+    if not _LAST_GROUNDING:
+        return keypoints
+    restored, changed = undo_normalization(
+        keypoints, _LAST_GROUNDING["points"], _LAST_GROUNDING["size"]
+    )
+    if changed:
+        print(
+            "⚠️ [Keypoints] Received keypoints rescaled to the normalized grid;"
+            " restored the pixel coordinates returned by pixelpoint_objects."
+            " Pass keypoints unchanged."
+        )
+    return restored
+
+
+def resolve_output_dir(output_dir: Optional[str] = None) -> str:
+    """Resolves the artifact directory: active experiment, then argument, then default."""
+    return (
+        os.environ.get("CURRENT_EXP_DIR") or output_dir or config.DEFAULT_OUTPUT_DIR
+    )
 
 
 def get_headers() -> Dict[str, str]:
     """Generates standard authorization headers for upstream API requests."""
     return {
-        "Authorization": f"Bearer {config.FIREWORKS_API_KEY}",
-        "HTTP-Referer": "https://colab.research.google.com",
-        "X-Title": "UAV_AGENT",
+        "Authorization": f"Bearer {config.LLM_API_KEY}",
         "Content-Type": "application/json",
     }
 
@@ -74,17 +120,318 @@ def get_coords(kp: Any) -> Tuple[float, float]:
 
 
 # ==============================================================================
+# Scenario Resolution
+# ==============================================================================
+# Maps free-form operator requests and incident names onto `config.SCENARIOS`,
+# so every module agrees on scenario naming.
+
+def canonical_incident(name: Optional[str]) -> str:
+    """Normalizes an incident name or alias to its canonical scenario key.
+
+    Args:
+        name: Incident type, data folder name, or alias (e.g. 'cars_accident').
+
+    Returns:
+        Canonical key of `config.SCENARIOS`, or `config.UNKNOWN_INCIDENT`.
+    """
+    key = re.sub(r"[\s\-]+", "_", str(name or "").strip().lower())
+    if key in config.SCENARIOS:
+        return key
+    for scenario_key, scenario in config.SCENARIOS.items():
+        if key == scenario["folder"] or key in scenario.get("aliases", []):
+            return scenario_key
+    return config.UNKNOWN_INCIDENT
+
+
+def _keyword_hits(text: str, keyword: str) -> int:
+    # Whole words only (with an optional plural), so 'car' does not match 'careful'
+    pattern = rf"(?<![a-z]){re.escape(keyword.lower())}(?:e?s)?(?![a-z])"
+    return len(re.findall(pattern, text))
+
+
+def match_scenario(text: str) -> Optional[str]:
+    """Finds the scenario whose keywords occur most often in the text.
+
+    Args:
+        text: Operator request or mission description.
+
+    Returns:
+        Canonical scenario key, or None when no keyword is present. Ties are
+        resolved in favour of the scenario declared first in `config.SCENARIOS`.
+    """
+    text = str(text or "").lower()
+    best_key, best_score = None, 0
+    for key, scenario in config.SCENARIOS.items():
+        required = scenario.get("required_keywords")
+        if required and not any(_keyword_hits(text, kw) for kw in required):
+            continue
+        score = len(
+            [kw for kw in scenario.get("keywords", []) if _keyword_hits(text, kw)]
+        )
+        if score > best_score:
+            best_key, best_score = key, score
+    return best_key
+
+
+def detection_threshold(incident_type: Optional[str]) -> float:
+    """Probability above which the onboard verifier reports a frame for a scenario."""
+    scenario = config.SCENARIOS.get(canonical_incident(incident_type), {})
+    return float(scenario.get("detection_threshold", config.DETECTION_CONF_THRESHOLD))
+
+
+def scenario_info(key: str) -> Dict[str, str]:
+    """Returns the fields of a scenario that the mission pipeline works with."""
+    scenario = config.SCENARIOS[key]
+    return {
+        "request": scenario["request"],
+        "folder": scenario["folder"],
+        "target_object": scenario["target_object"],
+        "incident_type": key,
+    }
+
+
+def resolve_scenario(user_input: str) -> Dict[str, str]:
+    """Resolves console input (scenario key or free text) to a scenario description.
+
+    Args:
+        user_input: Scenario key, alias, or a natural language request.
+
+    Returns:
+        Dictionary with 'request', 'folder', 'target_object' and 'incident_type'.
+        A multi-word input replaces the default request text of the scenario.
+    """
+    raw_text = str(user_input or "").strip()
+
+    # 1. Default scenario if input is empty (user pressed Enter)
+    if not raw_text:
+        return scenario_info(config.DEFAULT_SCENARIO)
+
+    # 2. Direct match with a scenario key or alias (e.g. 'fire' or 'cars_accident')
+    direct_key = canonical_incident(raw_text)
+    if direct_key != config.UNKNOWN_INCIDENT:
+        return scenario_info(direct_key)
+
+    # 3. Keywords inside the entered sentence, then fallback to the default scenario
+    key = match_scenario(raw_text)
+    if key is None:
+        print(
+            f"⚠️ Keywords not recognized in '{user_input}'. Defaulting to"
+            f" '{config.DEFAULT_SCENARIO}' scenario."
+        )
+        key = config.DEFAULT_SCENARIO
+
+    scenario = scenario_info(key)
+    if len(raw_text.split()) > 1:
+        scenario["request"] = raw_text
+    return scenario
+
+
+# ==============================================================================
+# Keypoint Grounding Filters
+# ==============================================================================
+# A vision-language model occasionally answers without looking at the image and
+# returns fabricated coordinates (typically a regular row or column of points).
+# These helpers reject such answers and choose, among several independent
+# answers, the one that the others confirm best.
+
+def normalize_points(raw_points: Any, default_label: str) -> List[Dict[str, Any]]:
+    """Keeps well-formed points that lie on the grounding grid.
+
+    Args:
+        raw_points: Parsed model output (list of dicts or coordinate pairs).
+        default_label: Label for points that come without one.
+
+    Returns:
+        List of {'point_2d': [x, y], 'label': str, 'kind': 'object' | 'area'} in
+        grid coordinates. 'area' marks a point of a spread over a large region.
+    """
+    grid = config.GROUNDING_GRID_SIZE
+    points = []
+    for item in raw_points if isinstance(raw_points, list) else []:
+        if isinstance(item, dict) and "point_2d" not in item and not {"x", "y"} <= set(item):
+            continue
+        try:
+            x, y = get_coords(item)
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue
+        if not (0 <= x <= grid and 0 <= y <= grid):
+            continue
+        label = item.get("label", default_label) if isinstance(item, dict) else default_label
+        is_area = isinstance(item, dict) and str(item.get("kind", "")).lower() == "area"
+        points.append(
+            {"point_2d": [x, y], "label": str(label), "kind": "area" if is_area else "object"}
+        )
+    return points
+
+
+def looks_synthetic(points: Sequence[Dict[str, Any]]) -> bool:
+    """Detects fabricated answers: an axis-aligned line of evenly spaced points.
+
+    Real objects on aerial imagery are never both exactly aligned with an image
+    axis and equally spaced, while a model that ignores the image produces
+    exactly that pattern. Points of kind 'area' are not checked.
+
+    Args:
+        points: Points in grid coordinates.
+
+    Returns:
+        True when at least `config.GROUNDING_SYNTHETIC_MIN_POINTS` points share
+        one coordinate and are evenly spaced along the other.
+    """
+    # An even spread over a large area is requested from the model and is legitimate
+    coords = [get_coords(p) for p in points if p.get("kind") != "area"]
+    tolerance = config.GROUNDING_SYNTHETIC_AXIS_TOLERANCE
+    min_points = config.GROUNDING_SYNTHETIC_MIN_POINTS
+
+    for axis in (0, 1):
+        for anchor in coords:
+            line = sorted(
+                c[1 - axis] for c in coords if abs(c[axis] - anchor[axis]) <= tolerance
+            )
+            if len(line) < min_points:
+                continue
+            gaps = [b - a for a, b in zip(line, line[1:])]
+            mean_gap = sum(gaps) / len(gaps)
+            if mean_gap <= 0:
+                return True  # Many copies of the same point
+            # The median deviation ignores a single irregular gap
+            deviations = sorted(abs(g - mean_gap) for g in gaps)
+            if deviations[len(deviations) // 2] <= config.GROUNDING_SYNTHETIC_GAP_VARIATION * mean_gap:
+                return True
+    return False
+
+
+def select_best_answer(
+    runs: Sequence[Sequence[Dict[str, Any]]],
+    radius: Optional[float] = None,
+    max_points: Optional[int] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Picks the grounding answer that the other answers confirm best.
+
+    Whole answers are compared instead of intersecting their points. Compact
+    objects (buildings) are found at the same spots by every honest answer, so a
+    fabricated answer gets no support and loses. Area targets (water, forest)
+    are marked at different spots by every answer; intersecting them would
+    discard valid points, while here one complete answer is still returned.
+
+    Args:
+        runs: One list of points per independent model answer (grid coordinates).
+        radius: Distance within which points of two answers are the same object.
+            Defaults to `config.GROUNDING_MATCH_RADIUS`.
+        max_points: Maximum number of points returned. Defaults to
+            `config.MAX_KEYPOINTS`.
+
+    Returns:
+        Tuple of (points of the chosen answer, confirmed points first; number of
+        its points that another answer reproduces). Empty when no answer has
+        points or at least half of the answers found nothing.
+    """
+    radius = config.GROUNDING_MATCH_RADIUS if radius is None else radius
+    max_points = config.MAX_KEYPOINTS if max_points is None else max_points
+
+    non_empty = [run for run in runs if run]
+    if not non_empty or 2 * len(non_empty) <= len(runs) and len(runs) > 1:
+        return [], 0
+
+    def confirmed(run_idx: int) -> List[bool]:
+        others = [get_coords(p) for k, run in enumerate(runs) if k != run_idx for p in run]
+        flags = []
+        for point in runs[run_idx]:
+            x, y = get_coords(point)
+            flags.append(any(math.hypot(x - ox, y - oy) <= radius for ox, oy in others))
+        return flags
+
+    best_idx, best_flags = None, []
+    for run_idx, run in enumerate(runs):
+        if not run:
+            continue
+        flags = confirmed(run_idx)
+        key = (sum(flags), len(run))
+        if best_idx is None or key > (sum(best_flags), len(runs[best_idx])):
+            best_idx, best_flags = run_idx, flags
+
+    points = [dict(p) for p in runs[best_idx]]
+    ordered = [p for p, ok in zip(points, best_flags) if ok] + [
+        p for p, ok in zip(points, best_flags) if not ok
+    ]
+    return ordered[:max_points], sum(best_flags)
+
+
+def undo_normalization(
+    keypoints: Sequence[Any],
+    reference_points: Sequence[Dict[str, Any]],
+    image_size: Tuple[int, int],
+    grid: Optional[int] = None,
+    tolerance: float = 2.0,
+) -> Tuple[List[Any], bool]:
+    """Restores pixel keypoints that were rescaled to the normalized grid.
+
+    Grounding returns pixel coordinates of the map. An agent may convert them to
+    the 0..grid range before passing them on, which shifts every waypoint. When
+    the passed keypoints equal the grounding output scaled by grid / image size,
+    the original pixel points are returned instead.
+
+    Args:
+        keypoints: Keypoints received by a tool.
+        reference_points: Pixel keypoints last returned by the grounding tool.
+        image_size: (width, height) of the map the reference points belong to.
+        grid: Side of the normalized grid. Defaults to `config.GROUNDING_GRID_SIZE`.
+        tolerance: Allowed rounding difference in grid units.
+
+    Returns:
+        Tuple of (keypoints to use, whether a rescaling was undone).
+    """
+    grid = config.GROUNDING_GRID_SIZE if grid is None else grid
+    width, height = image_size
+    if not keypoints or not reference_points or (width == grid and height == grid):
+        return list(keypoints), False
+
+    references = [get_coords(r) for r in reference_points]
+
+    def find(x: float, y: float, scale_x: float, scale_y: float) -> Optional[int]:
+        for idx, (rx, ry) in enumerate(references):
+            if abs(rx * scale_x - x) <= tolerance and abs(ry * scale_y - y) <= tolerance:
+                return idx
+        return None
+
+    try:
+        coords = [get_coords(k) for k in keypoints]
+    except (TypeError, ValueError, IndexError, KeyError):
+        return list(keypoints), False
+
+    as_pixels = [find(x, y, 1.0, 1.0) for x, y in coords]
+    as_grid = [find(x, y, grid / width, grid / height) for x, y in coords]
+    pixel_hits = sum(m is not None for m in as_pixels)
+    grid_hits = sum(m is not None for m in as_grid)
+
+    # Rescaled input: most points match the scaled reference and not the original
+    if grid_hits < 0.8 * len(coords) or grid_hits <= pixel_hits:
+        return list(keypoints), False
+
+    restored = []
+    for keypoint, match in zip(keypoints, as_grid):
+        if match is None:
+            restored.append(keypoint)
+            continue
+        point = dict(reference_points[match])
+        if isinstance(keypoint, dict) and "label" in keypoint:
+            point["label"] = keypoint["label"]
+        restored.append(point)
+    return restored, True
+
+
+# ==============================================================================
 # Aspect-Ratio Letterbox & Coordinate Inversion Helpers
 # ==============================================================================
 
 def _prepare_letterbox(
-    img: Image.Image, target_size: int = 1000
+    img: Image.Image, target_size: int = config.GROUNDING_GRID_SIZE
 ) -> Tuple[Image.Image, Dict[str, Any]]:
     """Fits an image onto a standardized square canvas while preserving native aspect ratio.
 
     Args:
         img: Input PIL Image with arbitrary dimensions.
-        target_size: Target square canvas size (default: 1000x1000).
+        target_size: Target square canvas size (default: config.GROUNDING_GRID_SIZE).
 
     Returns:
         Tuple of (padded square PIL Image, metadata dictionary with scaling parameters).
@@ -212,7 +559,7 @@ def describe_satellite_image(image: Image.Image) -> str:
     Returns:
         str: Comprehensive textual description of the scene topology, hazards, and objects.
     """
-    api_key = config.FIREWORKS_API_KEY
+    api_key = config.LLM_API_KEY
     if not api_key:
         return "Error: No API key provided in configuration."
 
@@ -220,7 +567,7 @@ def describe_satellite_image(image: Image.Image) -> str:
         image = image.convert("RGB")
 
     buffered = io.BytesIO()
-    image.save(buffered, format="JPEG", quality=90)
+    image.save(buffered, format="JPEG", quality=config.IMAGE_JPEG_QUALITY)
     img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
 
     content = [
@@ -239,22 +586,17 @@ def describe_satellite_image(image: Image.Image) -> str:
     ]
 
     payload = {
-        "model": model,
-        "max_tokens": 1000,
-        "temperature": 0.5,
+        "model": config.MODEL_ID,
+        "max_tokens": config.VLM_DESCRIBE_MAX_TOKENS,
+        "temperature": config.VLM_TEMPERATURE,
         "top_p": 1,
         "top_k": 40,
         "messages": [{"role": "user", "content": content}],
     }
 
-    headers = {
-        "Accept": "application/json",
-        "X-Title": "Satellite Analysis App",
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
-
-    response = requests.post(path, headers=headers, json=payload)
+    response = requests.post(
+        config.LLM_CHAT_COMPLETIONS_URL, headers=get_headers(), json=payload
+    )
 
     if response.status_code != 200:
         return f"Error {response.status_code}: {response.text}"
@@ -281,7 +623,8 @@ def pixelpoint_objects(
         target_object: Alternative parameter for target description.
 
     Returns:
-        List[dict]: Detected targets with labels and 2D pixel coordinates in native resolution.
+        List[dict]: Detected targets with labels and 2D pixel coordinates of the input image
+            (not normalized). Pass them to other tools unchanged.
     """
     target_str = objects or target_object or "target object"
     if isinstance(target_str, list):
@@ -297,41 +640,54 @@ def pixelpoint_objects(
     if img.mode != "RGB":
         img = img.convert("RGB")
 
-    # 1. Project input onto standardized 1000x1000 canvas with aspect ratio preservation
-    square_img, meta = _prepare_letterbox(img, target_size=1000)
+    # 1. Project input onto standardized square canvas with aspect ratio preservation
+    grid = config.GROUNDING_GRID_SIZE
+    square_img, meta = _prepare_letterbox(img, target_size=grid)
 
     buffered = io.BytesIO()
-    square_img.save(buffered, format="JPEG", quality=90)
+    square_img.save(buffered, format="JPEG", quality=config.IMAGE_JPEG_QUALITY)
     img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-    # 2. Structured prompt enforcing centroid grounding and shadow invariance
+    # 2. Structured prompt: one centred point per compact object, an even spread
+    #    of points over large areas such as water or forest
     prompt = f"""
-    CRITICAL COORDINATE SPECIFICATIONS:
+    This is the input satellite image. You need to detect keypoints of {target_str} for drone navigation.
+    A reconnaissance drone will fly to every keypoint and inspect the ground around it.
+
+    COORDINATE SPECIFICATIONS:
+    - The image canvas is defined on a normalized {grid}x{grid} integer grid.
+    - Top-left corner is [0, 0]. Bottom-right corner is [{grid}, {grid}].
+    - Both X and Y must be integers strictly within range [0, {grid}].
+    - Do not output points on empty background or padding areas.
+
+    There are two kinds of targets. Decide the kind of every target yourself.
+
+    KIND "object" - compact objects such as buildings, vehicles, tanks, junctions:
+    - Output exactly one point per object, at the geometric center of the object.
     - Focus strictly on the illuminated physical roof surfaces.
     - Ignore cast shadows entirely: do not place coordinates between the building and its shadow.
     - Center rule: Coordinates must be placed strictly on the centroid of the roof perimeter, not on edges or driveways.
-    - The image canvas is defined on a normalized 1000x1000 integer grid.
-    - Top-left corner is [0, 0]. Bottom-right corner is [1000, 1000].
-    - Both X and Y must be integers strictly within range [0, 1000].
-    - Place coordinates exactly at the geometric center of each '{target_str}'.
-    - Do not output points on empty background or padding areas.
 
-    This is the input satellite image. You need to detect all keypoints of {target_str} for drone navigation.
-    Return maximum 15 points of '{target_str}'.
+    KIND "area" - large continuous regions such as open water, sea, lakes, rivers, forest, fields, open terrain:
+    - A single point in the middle is NOT enough: the drone must survey the whole region.
+    - Spread points evenly over the ENTIRE visible extent of the region, about {config.GROUNDING_AREA_SPACING} grid units apart, in every direction.
+    - Cover the far parts of the region too, including the parts close to its shores or edges.
+    - Keep every point inside the region and at least {config.GROUNDING_BORDER_MARGIN} grid units away from the image border.
+    - Use the whole point budget when the region is large.
+
+    Return maximum {config.MAX_KEYPOINTS} points in total.
     Do not confuse with surrounding noise or background textures.
+    For EVERY point, identify its SPECIFIC visual type from the {target_str} category.
     Provide only the answer in json. Return them STRICTLY in the form:
     ```json
     [
-      {{"point_2d": [x1, y1], "label": "{target_str}"}},
-      {{"point_2d": [x2, y2], "label": "{target_str}"}}
+      {{"point_2d": [x1, y1], "label": "Here is the specific label of the detected target", "kind": "object"}},
+      {{"point_2d": [x2, y2], "label": "Here is the specific label of the detected target", "kind": "area"}}
     ]
     ```
     """
 
-    headers = {
-        "Authorization": f"Bearer {config.FIREWORKS_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    headers = get_headers()
 
     data_payload = {
         "model": config.MODEL_ID,
@@ -353,113 +709,198 @@ def pixelpoint_objects(
                 ],
             },
         ],
-        "temperature": getattr(config, "Temp", 0.0),
+        "temperature": config.GROUNDING_TEMPERATURE,
     }
 
-    raw_points = []
-    max_retries = 3
-
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(
-                config.OPENROUTER_BASE_URL,
-                headers=headers,
-                json=data_payload,
-                timeout=120,
-            )
-
-            if response.status_code == 200:
-                raw_content = response.json()["choices"][0]["message"]["content"]
-                json_str = re.sub(r"```json\s*|\s*```", "", raw_content).strip()
-
-                try:
-                    raw_points = json.loads(json_str)
-                except json.JSONDecodeError:
-                    objects_found = re.findall(
-                        r'\{[^{}]*"point_2d"\s*:\s*\[\s*\d+\s*,\s*\d+\s*\]\s*,\s*"label"\s*:\s*"[^"]+"\s*\}',
-                        json_str,
-                    )
-                    raw_points = (
-                        json.loads("[\n" + ",\n".join(objects_found) + "\n]")
-                        if objects_found
-                        else []
-                    )
-                break
-
-            if response.status_code in (400, 401, 403):
-                print(
-                    f"❌ Critical API error ({response.status_code}): {response.text}"
+    def request_points() -> Optional[List[Dict[str, Any]]]:
+        """One grounding request; None when the API did not return an answer."""
+        for attempt in range(config.GROUNDING_MAX_RETRIES):
+            try:
+                response = requests.post(
+                    config.LLM_CHAT_COMPLETIONS_URL,
+                    headers=headers,
+                    json=data_payload,
+                    timeout=config.GROUNDING_TIMEOUT_S,
                 )
-                break
 
-            print(
-                f"⚠️ Attempt {attempt + 1} returned status code {response.status_code}. Retrying..."
-            )
-            time.sleep(5)
+                if response.status_code == 200:
+                    raw_content = response.json()["choices"][0]["message"]["content"]
+                    json_str = re.sub(r"```json\s*|\s*```", "", raw_content).strip()
 
-        except Exception as e:
-            print(f"DEBUG: Attempt {attempt + 1} failed: {e}")
-            time.sleep(5)
+                    try:
+                        parsed = json.loads(json_str)
+                    except json.JSONDecodeError:
+                        objects_found = re.findall(
+                            r'\{[^{}]*"point_2d"\s*:\s*\[\s*\d+\s*,\s*\d+\s*\][^{}]*\}',
+                            json_str,
+                        )
+                        parsed = (
+                            json.loads("[\n" + ",\n".join(objects_found) + "\n]")
+                            if objects_found
+                            else []
+                        )
+                    return normalize_points(parsed, target_str)
 
-    # 3. Invert transformation back to native metric pixel coordinates
-    return _restore_points(raw_points, meta, target_str)
+                if response.status_code in (400, 401, 403):
+                    print(
+                        f"❌ Critical API error ({response.status_code}): {response.text}"
+                    )
+                    return None
+
+                print(
+                    f"⚠️ Attempt {attempt + 1} returned status code {response.status_code}. Retrying..."
+                )
+                time.sleep(config.GROUNDING_RETRY_DELAY_S)
+
+            except Exception as e:
+                print(f"DEBUG: Attempt {attempt + 1} failed: {e}")
+                time.sleep(config.GROUNDING_RETRY_DELAY_S)
+        return None
+
+    # 3. Ask several times in parallel and use the answer the others confirm best.
+    #    A model that answers without looking at the image returns fabricated
+    #    coordinates; such answers are dropped or outvoted here.
+    votes = max(1, config.GROUNDING_VOTES)
+    grid_points: List[Dict[str, Any]] = []
+
+    def usable_answers(count: int) -> List[List[Dict[str, Any]]]:
+        with ThreadPoolExecutor(max_workers=count) as executor:
+            answers = list(executor.map(lambda _: request_points(), range(count)))
+        usable = []
+        for answer in answers:
+            if answer is None:
+                continue
+            if looks_synthetic(answer):
+                print("⚠️ [Grounding] Discarded an answer with fabricated, evenly spaced points.")
+                continue
+            usable.append(answer)
+        return usable
+
+    for round_idx in range(max(1, config.GROUNDING_MAX_ROUNDS)):
+        runs = usable_answers(votes)
+        if 0 < len(runs) < votes:
+            # Replace discarded answers once, so the vote keeps its full size
+            runs += usable_answers(votes - len(runs))
+
+        if not runs:
+            print(f"⚠️ [Grounding] Round {round_idx + 1}: no usable answer. Retrying...")
+            continue
+
+        grid_points, confirmed = select_best_answer(runs)
+        print(
+            f"📍 [Grounding] {len(grid_points)} keypoints from the best of {len(runs)}"
+            f" answers ({confirmed} reproduced by another answer)."
+        )
+        break
+    else:
+        print("❌ [Grounding] No usable answer; returning an empty list.")
+
+    # 4. Invert transformation back to native metric pixel coordinates
+    pixel_points = _restore_points(grid_points, meta, target_str)
+    _LAST_GROUNDING.clear()
+    _LAST_GROUNDING.update(size=img.size, points=[dict(p) for p in pixel_points])
+    return pixel_points
 
 
 @tool
 def visualize_keypoints_from_image(
     image: Image.Image,
     keypoints: list,
-    output_dir: str = "uav_logs",
+    output_dir: str = config.DEFAULT_OUTPUT_DIR,
 ) -> str:
-    """Visualizes candidate inspection targets on the base terrain image and saves the plot.
+    """Visualizes candidate inspection targets with clean frameless text on the base terrain image.
 
     Args:
         image: Base PIL image representing the operational map.
-        keypoints: Target keypoints list (dicts with 'point_2d' or (x, y) tuples).
+        keypoints: Target keypoints in pixel coordinates of the image, exactly as returned by
+            `pixelpoint_objects`.
         output_dir: Target directory to save the visualization plot. Defaults to 'uav_logs'.
 
     Returns:
         str: Confirmation message detailing the destination file path.
     """
-    # Priority: Environment variable -> parameter override -> fallback default
-    target_dir = os.environ.get("CURRENT_EXP_DIR") or output_dir or "uav_logs"
+    target_dir = resolve_output_dir(output_dir)
     os.makedirs(target_dir, exist_ok=True)
+    keypoints = ensure_pixel_keypoints(keypoints)
 
-    image = image.convert("RGB")
-    draw = ImageDraw.Draw(image)
+    img_rgb = image.convert("RGB")
+    draw = ImageDraw.Draw(img_rgb)
 
-    try:
-        font = ImageFont.truetype("arial.ttf", 15)
-    except IOError:
+    # Pick the first available font
+    font = None
+    for font_path in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+        "arial.ttf",
+    ]:
+        try:
+            font = ImageFont.truetype(font_path, 11)
+            break
+        except IOError:
+            continue
+    if font is None:
         font = ImageFont.load_default()
+
+    # Alternate label offsets so that nearby labels do not overlap
+    offsets = [
+        (6, -14),
+        (6, 4),
+        (-6, -14),
+        (-6, 4),
+    ]
 
     for idx, kp in enumerate(keypoints):
         x, y = get_coords(kp)
-        label = (
-            f"{idx + 1}. {kp.get('label', 'point')}"
-            if isinstance(kp, dict)
-            else f"{idx + 1}. target"
-        )
-
-        # Coordinates are already projected into native image scale
         x, y = int(round(x)), int(round(y))
 
-        if idx == 0:
-            draw.ellipse([(x - 4, y - 4), (x + 4, y + 4)], fill="red")
+        # Clean up the object label
+        if isinstance(kp, dict):
+            raw_label = str(kp.get("label", "Target")).strip()
+            clean_word = re.split(r"[,;/\n]", raw_label)[0].strip()
+            clean_word = clean_word.replace("_", " ").title()
         else:
-            draw.ellipse([(x - 3, y - 3), (x + 3, y + 3)], outline="red", width=2)
+            clean_word = "Target"
 
-        draw.text((x + 8, y - 8), label, fill="blue", font=font)
+        label_text = f"#{idx + 1} {clean_word}"
 
-    output_path = os.path.join(target_dir, "uav_trajectory.png")
+        # 1. Minimal point marker (coral centre with a white outline)
+        r = 3
+        draw.ellipse(
+            [(x - r, y - r), (x + r, y + r)],
+            fill="#FF5252",
+            outline="#FFFFFF",
+            width=1,
+        )
 
-    fig = plt.figure(figsize=(8, 8))
-    plt.imshow(image)
+        # 2. Compute the label position
+        dx, dy = offsets[idx % len(offsets)]
+        bbox = draw.textbbox((0, 0), label_text, font=font)
+        text_w = bbox[2] - bbox[0]
+
+        # Labels shifted to the left are right-aligned against the point
+        text_x = x - text_w + dx if dx < 0 else x + dx
+        text_y = y + dy
+
+        # 3. Frameless text with a soft contrasting stroke
+        draw.text(
+            (text_x, text_y),
+            label_text,
+            fill="#FDE047",           # Warm amber, readable on vegetation and soil
+            stroke_width=1,
+            stroke_fill="#0F172A",     # Dark navy halo for readability
+            font=font,
+        )
+
+    output_path = os.path.join(target_dir, config.TRAJECTORY_FILENAME)
+
+    fig = plt.figure(figsize=(10, 10))
+    plt.imshow(img_rgb)
+    plt.title(f"Target Waypoints ({len(keypoints)} inspection sites)", fontsize=13, pad=10)
     plt.axis("off")
-    plt.savefig(output_path, bbox_inches="tight", dpi=300)
+    plt.savefig(output_path, bbox_inches="tight", dpi=config.TRAJECTORY_DPI)
     plt.close(fig)
 
-    return f"Saved visualization with {len(keypoints)} targets to {output_path}."
+    return f"Saved clean trajectory map with {len(keypoints)} labeled targets to {output_path}."
 
 
 @tool
@@ -468,11 +909,11 @@ def uav_simulation(
     labeled_points: Optional[List[Any]] = None,
     waypoints: Optional[List[Any]] = None,
     drone_id: int = 0,
-    total_drones: int = 3,
-    speed_px: float = 6.0,
-    crop_size: int = 128,
-    home_point: Tuple[int, int] = (50, 50),
-    output_dir: str = "uav_logs",
+    total_drones: int = config.COUNTER_DRONES,
+    speed_px: float = config.UAV_SPEED_PX,
+    crop_size: int = config.CAMERA_CROP_SIZE,
+    home_point: Tuple[int, int] = config.DEFAULT_HOME_POINT,
+    output_dir: str = config.DEFAULT_OUTPUT_DIR,
 ) -> Dict[str, Tuple[Image.Image, Tuple[int, int]]]:
     """Simulates continuous UAV flight trajectories and renders a combined swarm MP4 video.
 
@@ -493,7 +934,7 @@ def uav_simulation(
     global _SWARM_TRAJECTORIES, SWARM_FLIGHT_TIMES, CURRENT_OUTPUT_DIR
 
     # Priority: Environment variable -> parameter override -> fallback default
-    target_dir = os.environ.get("CURRENT_EXP_DIR") or output_dir or "uav_logs"
+    target_dir = resolve_output_dir(output_dir)
     CURRENT_OUTPUT_DIR = target_dir
     os.makedirs(target_dir, exist_ok=True)
 
@@ -542,13 +983,7 @@ def uav_simulation(
     if not clean_points:
         raise ValueError("Valid target coordinates could not be parsed from input.")
 
-    drone_colors = [
-        "#FF3333",  # Drone 0: Red
-        "#3388FF",  # Drone 1: Blue
-        "#33CC33",  # Drone 2: Green
-        "#FF9900",  # Drone 3: Orange
-        "#9933FF",  # Drone 4: Purple
-    ]
+    drone_colors = config.DRONE_COLORS
 
     # 1. Construct continuous trajectory waypoints
     full_path = [home_point_clean] + clean_points + [home_point_clean]
@@ -573,7 +1008,9 @@ def uav_simulation(
         )
         for k in range(1, len(continuous_coords))
     )
-    flight_sec = (total_dist_px * 1.35) / 6.0
+    flight_sec = (
+        total_dist_px * config.GROUND_SAMPLING_DISTANCE_M
+    ) / config.CRUISE_SPEED_M_PER_S
 
     with _SWARM_LOCK:
         SWARM_FLIGHT_TIMES[drone_id] = flight_sec
@@ -592,7 +1029,7 @@ def uav_simulation(
         frame_key = f"drone{drone_id}_frame_{idx:04d}"
         return frame_key, (cam_crop, (cx, cy))
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=config.SIMULATION_WORKERS) as executor:
         frames_dict = dict(executor.map(extract_frame, enumerate(continuous_coords)))
 
     # 3. Synchronized swarm flight video rendering
@@ -635,17 +1072,23 @@ def uav_simulation(
 
             return cv2.cvtColor(np.array(swarm_vis), cv2.COLOR_RGB2BGR)
 
-        with ThreadPoolExecutor(max_workers=8) as video_executor:
-            rendered_frames = list(video_executor.map(render_video_frame, time_steps))
-
-        video_path = os.path.join(target_dir, "uav_flight_all_drones.mp4")
-        fps = 13
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        video_writer = cv2.VideoWriter(video_path, fourcc, fps, (img_w, img_h))
+        video_path = os.path.join(target_dir, config.VIDEO_FILENAME)
+        fourcc = cv2.VideoWriter_fourcc(*config.VIDEO_CODEC)
+        video_writer = cv2.VideoWriter(
+            video_path, fourcc, config.VIDEO_FPS, (img_w, img_h)
+        )
 
         if video_writer.isOpened():
-            for frame in rendered_frames:
-                video_writer.write(frame)
+            # Render and write chunk by chunk so only a few frames stay in memory
+            chunk = max(1, config.VIDEO_CHUNK_FRAMES)
+            with ThreadPoolExecutor(
+                max_workers=config.SIMULATION_WORKERS
+            ) as video_executor:
+                for start in range(0, len(time_steps), chunk):
+                    for frame in video_executor.map(
+                        render_video_frame, time_steps[start : start + chunk]
+                    ):
+                        video_writer.write(frame)
             video_writer.release()
             print(f"[SWARM SUCCESS] Saved MP4 flight video to: {video_path}")
         else:
@@ -656,134 +1099,6 @@ def uav_simulation(
 
     return frames_dict
 
-
-@tool
-def detect_and_display(
-    frames_dict: Dict[str, Tuple[Image.Image, Tuple[int, int]]],
-    target_object: str,
-    output_dir: Optional[str] = None,
-) -> List[Tuple[int, int]]:
-    """Detects target objects across UAV camera frames and logs confirmed detection artifacts.
-
-    Args:
-        frames_dict: Dictionary mapping frame identifiers to tuples of (PIL Image, (x, y) coordinates).
-        target_object: Name or semantic label of the object to search for (e.g., 'fire', 'car accident').
-        output_dir: Target folder to save detection images and summary artifacts.
-
-    Returns:
-        List of (x, y) coordinate tuples where the target was confirmed.
-    """
-    # Priority: Environment variable -> parameter override -> fallback default
-    target_dir = os.environ.get("CURRENT_EXP_DIR") or output_dir or "uav_logs"
-    os.makedirs(target_dir, exist_ok=True)
-
-    headers = {
-        "Authorization": f"Bearer {config.FIREWORKS_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    # 1. Subsample every 4th frame to balance inspection fidelity and API rate limits
-    selected_frames = [
-        (frame_name, img, coords)
-        for idx, (frame_name, (img, coords)) in enumerate(frames_dict.items())
-        if idx % 4 == 0
-    ]
-
-    print(
-        f"🔍 Running parallel VLM verification for '{target_object}' across "
-        f"{len(selected_frames)} candidate frames into directory: {target_dir}..."
-    )
-
-    detected_records = []
-    records_lock = threading.Lock()
-
-    # 2. Parallel frame evaluation via ThreadPoolExecutor
-    def process_single_frame(frame_data):
-        frame_name, img, coords = frame_data
-        buffered = BytesIO()
-        img.save(buffered, format="JPEG", quality=85)
-        img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-
-        prompt = f"Do you see any {target_object}? Answer ONLY with 'YES' or 'NO'."
-        data = {
-            "model": config.MODEL_ID,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{img_base64}"
-                            },
-                        },
-                    ],
-                }
-            ],
-            "temperature": getattr(config, "TEMPERATURE", 0.0),
-        }
-
-        try:
-            resp = requests.post(
-                config.OPENROUTER_BASE_URL,
-                headers=headers,
-                json=data,
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                desc = resp.json()["choices"][0]["message"]["content"].strip()
-                if "YES" in desc.upper():
-                    print(
-                        f"🎯 Target '{target_object}' confirmed at coordinates {coords} in {frame_name}"
-                    )
-                    save_path = os.path.join(
-                        target_dir, f"{target_object}_{frame_name}.png"
-                    )
-                    img.save(save_path)
-
-                    with records_lock:
-                        detected_records.append({
-                            "frame": frame_name,
-                            "coordinates": coords,
-                            "file_path": save_path,
-                        })
-                    return coords
-        except Exception:
-            pass
-        return None
-
-    # 3. Execute thread pool and aggregate confirmed detection points
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        results = list(executor.map(process_single_frame, selected_frames))
-
-    detected_coordinates = [c for c in results if c is not None]
-
-    # 4. Export structured detection summary JSON
-    summary_path = os.path.join(target_dir, f"detections_{target_object}.json")
-    try:
-        with open(summary_path, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "target_object": target_object,
-                    "total_inspected_frames": len(selected_frames),
-                    "detections_count": len(detected_coordinates),
-                    "detections": detected_records,
-                },
-                f,
-                indent=2,
-                ensure_ascii=False,
-            )
-        print(f"📁 Structured verification log saved to: {summary_path}")
-    except Exception as e:
-        print(f"Warning: Failed to export detection log: {e}")
-
-    print(
-        f"\n✅ Visual inspection completed. Confirmed target locations: {len(detected_coordinates)}"
-    )
-    return detected_coordinates
-
-
 @tool
 def get_folder_by_query(query: str) -> dict:
     """Analyzes an operational request to resolve incident type, data folder, and target label.
@@ -792,74 +1107,49 @@ def get_folder_by_query(query: str) -> dict:
         query: Operator prompt or mission specification string.
 
     Returns:
-        dict: Mapping containing resolved folder key, target object, and incident type.
+        dict: Mapping with 'folder', 'incident_type' and 'target_object'. Unrecognised
+            requests return the baseline folder and incident type 'unknown'.
     """
+    unknown = {
+        "folder": config.BASELINE_FOLDER,
+        "incident_type": config.UNKNOWN_INCIDENT,
+        "target_object": config.UNKNOWN_TARGET_OBJECT,
+    }
+
+    def describe(key: str) -> dict:
+        info = scenario_info(key)
+        return {
+            "folder": info["folder"],
+            "incident_type": info["incident_type"],
+            "target_object": info["target_object"],
+        }
+
     # 1. Handle dictionary-formatted string inputs
     if isinstance(query, str) and query.strip().startswith("{"):
         try:
             parsed = ast.literal_eval(query)
             if isinstance(parsed, dict) and "folder" in parsed:
+                key = canonical_incident(
+                    parsed.get("incident_type") or parsed.get("folder")
+                )
+                if key != config.UNKNOWN_INCIDENT:
+                    return describe(key)
                 return {
-                    "folder": parsed.get("folder", "default"),
-                    "target_object": parsed.get("target_object", "unknown"),
-                    "incident_type": parsed.get("incident_type", "unknown"),
+                    "folder": parsed.get("folder", unknown["folder"]),
+                    "incident_type": config.UNKNOWN_INCIDENT,
+                    "target_object": parsed.get(
+                        "target_object", unknown["target_object"]
+                    ),
                 }
         except Exception:
             pass
 
-    # 2. Semantic keyword classification
-    query_lower = str(query).lower()
+    # 2. Scenario key / alias, then whole-word keyword classification
+    key = canonical_incident(query)
+    if key == config.UNKNOWN_INCIDENT:
+        key = match_scenario(str(query))
 
-    keywords_map = {
-        "fire": [
-            "fire",
-            "smoke",
-            "flame",
-            "burn",
-            "burning",
-            "on right now",
-            "heat",
-            "blaze",
-        ],
-        "oil_spill": [
-            "oil",
-            "spill",
-            "leak",
-            "slick",
-            "pollution",
-            "pipeline",
-        ],
-        "cars_accident": [
-            "car",
-            "accident",
-            "crash",
-            "collision",
-            "vehicle",
-            "police",
-        ],
-        "hogweed_thickets": [
-            "hogweed",
-            "weed",
-            "thicket",
-            "plant",
-            "heracleum",
-            "growth",
-        ],
-        "illegal_buildings": [
-            "illegal",
-            "building",
-            "construction",
-            "unauthorized",
-            "shed",
-            "house",
-        ],
-    }
-
-    for incident, markers in keywords_map.items():
-        if any(marker in query_lower for marker in markers):
-            return {"folder": incident, "incident_type": incident}
-
-    return {"folder": "default", "incident_type": "unknown"}
+    return describe(key) if key else unknown
 
 
 @tool
@@ -884,10 +1174,7 @@ def extract_inspection_targets(user_request: str) -> list:
     Output format example: ["building", "smoke source", "parking lot"]
     """
 
-    headers = {
-        "Authorization": f"Bearer {config.FIREWORKS_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    headers = get_headers()
 
     data = {
         "model": config.MODEL_ID,
@@ -895,15 +1182,15 @@ def extract_inspection_targets(user_request: str) -> list:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f'User Request: "{user_request}"'},
         ],
-        "temperature": Temp,
+        "temperature": config.VLM_TEMPERATURE,
     }
 
     try:
         response = requests.post(
-            config.OPENROUTER_BASE_URL,
+            config.LLM_CHAT_COMPLETIONS_URL,
             headers=headers,
             json=data,
-            timeout=180,
+            timeout=config.TARGET_EXTRACTION_TIMEOUT_S,
         )
         response.raise_for_status()
 
