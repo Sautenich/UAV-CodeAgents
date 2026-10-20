@@ -23,3 +23,6 @@ experiments/
 uav_logs/
 *.db
 *.sqlite3
+
+# Demo video: kept out of git until the HRI 2027 review ends (2027-01-13)
+media/
