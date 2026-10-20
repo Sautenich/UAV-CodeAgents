@@ -29,11 +29,12 @@ COUNTER_DRONES = 3
 
 # API key for the OpenAI-compatible gateway. `MY_KEY` is the legacy variable name.
 LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("MY_KEY")
-# Gateway root; any OpenAI-compatible provider works (starimg, OpenRouter, Fireworks, ...)
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://ai.starimg.ru/v1")
+# Gateway root; OpenRouter by default, any OpenAI-compatible provider works
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
 LLM_CHAT_COMPLETIONS_URL = f"{LLM_BASE_URL.rstrip('/')}/chat/completions"
 # Model used both by the agents and by the perception tools
-MODEL_ID = os.getenv("LLM_MODEL_ID", "gemini-3.8-flash")
+# Model ids follow the gateway's naming; OpenRouter uses provider/model
+MODEL_ID = os.getenv("LLM_MODEL_ID", "google/gemini-3.8-flash")
 
 # Agent LLM client behaviour (LiteLLM)
 LLM_TIMEOUT_S = 500

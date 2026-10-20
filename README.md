@@ -88,8 +88,8 @@ UAV-CodeAgents/
 - Linux (tested on Ubuntu) with Python 3.10 or newer
 - NVIDIA GPU with at least 6 GB of memory and a recent driver (tested on an RTX 4050 laptop GPU)
 - About 6 GB of disk space for the model weights
-- An API key for an OpenAI-compatible gateway that serves the planning model
-  (e.g. `gemini-3.8-flash`, `gpt-6.1-sol` or `qwen3.8-max`)
+- An [OpenRouter](https://openrouter.ai) API key, or a key for another OpenAI-compatible
+  gateway that serves the planning model (e.g. Gemini 3.8 Flash, GPT-6.1 Sol or Qwen3.8 Max)
 
 ## Installation
 
@@ -130,9 +130,9 @@ Open `.env` and fill in:
 
 | Variable | Meaning |
 |---|---|
-| `LLM_API_KEY` | key of the OpenAI-compatible gateway |
-| `LLM_BASE_URL` | gateway root URL, for example `https://ai.starimg.ru/v1` or an OpenRouter endpoint |
-| `LLM_MODEL_ID` | default planning model, for example `gemini-3.8-flash` |
+| `LLM_API_KEY` | OpenRouter API key (or the key of another OpenAI-compatible gateway) |
+| `LLM_BASE_URL` | gateway root URL; `https://openrouter.ai/api/v1` by default |
+| `LLM_MODEL_ID` | default planning model in the gateway's naming, for example `google/gemini-3.8-flash` |
 | `PHOENIX_ENABLED` | optional, `1` to trace agent runs in Phoenix (see below) |
 
 **5. Check the installation**
@@ -155,7 +155,7 @@ python main.py --scenario fire --drones 3 --start 1 --total 1
 keep the results in their own folder:
 
 ```bash
-python main.py --scenario oil_spill --model gpt-6.1-sol --drones 3 --start 1 --total 5 --out experiments/oil_gpt
+python main.py --scenario oil_spill --model openai/gpt-6.1-sol --drones 3 --start 1 --total 5 --out experiments/oil_gpt
 ```
 
 **Interactive.** Without `--scenario` the runner asks for a request and picks
